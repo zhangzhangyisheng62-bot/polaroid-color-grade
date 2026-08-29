@@ -24,7 +24,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/<your-name>/polaroid-color-grade.git
+git clone https://github.com/zhangzhangyisheng62-bot/polaroid-color-grade.git
 cd polaroid-color-grade
 pip install -r requirements.txt
 ```
