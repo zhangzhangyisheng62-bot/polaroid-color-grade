@@ -10,7 +10,7 @@ polaroid-color-grade (v2.3)
 - halation 光晕：亮区暖色洇散
 - 饱和度降低约 20%，降清晰度 + 双半径柔焦
 - 极轻的暖色粗颗粒 + 柯达 Portra 400 风格细颗粒
-- 3-6 条直线划痕 + 2-3 条随机游走的弯曲刮痕
+- 每张图 4-5 处不规则弯曲的自然小刮痕（随机游走折线，每条弯曲程度随机）
 - 经典 Polaroid 暖白边框 #F8F6F1（短边 10%，底边 1.8 倍厚）
 - 保持原图宽高比，不裁剪、不变形
 
@@ -297,52 +297,37 @@ def add_grain(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
 
 def add_scratches(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
     """
-    v2 划痕（保留效果，但对齐参考图水平）：
-    - 数量 6-12 → 3-6 条
-    - 亮度 0.15-0.30 → 0.06-0.14（约减半）
-    - 其余不变（短、1px、柔化）
+    自然小刮痕（v2.3 修复：等比还原旧版"刮痕↔图片"相对关系，大图依旧轻微）：
+    - 线宽：旧版 1px / 1024 长边 → 按 max(w,h)/1024 等比（约 5px）
+    - 长度：旧版 40-130px / 1024 → 等比为短边的 4%-13%
+    - 透明度：0.20-0.38（适度可见，呈偏白色细痕；之前 0.06-0.14 过淡）
+    - 每张图 4-5 条，全部不规则弯曲
     """
     h, w, _ = arr.shape
     rng = np.random.default_rng()
 
-    n_scratches = int(3 + 2 * strength) + rng.integers(0, 2)
+    # 分辨率缩放：以 1024 长边为基准，等比还原旧版相对尺寸
+    scale = max(w, h) / 1024.0
+    lw = max(1, int(round(scale)))              # 线宽等比（旧版 1px/1024）
+    blur_r = max(0.4, 0.4 * scale)              # 柔化随分辨率
+    base = min(w, h)
+
+    n_scratches = int(rng.integers(4, 6))       # 4-5 条
     canvas = np.zeros((h, w), dtype=np.float32)
 
     for _ in range(n_scratches):
-        x0 = int(rng.integers(int(w * 0.05), int(w * 0.95)))
-        y0 = int(rng.integers(int(h * 0.05), int(h * 0.95)))
-
-        length = int(rng.integers(10, 80))
-        angle = float(rng.uniform(0, 2 * np.pi))
-
-        if rng.random() < 0.05:
-            length = int(rng.integers(100, 180))
-
-        x1 = int(np.clip(x0 + np.cos(angle) * length, 0, w - 1))
-        y1 = int(np.clip(y0 + np.sin(angle) * length, 0, h - 1))
-
-        scratch_pil = Image.new("L", (w, h), 0)
-        draw = ImageDraw.Draw(scratch_pil)
-        draw.line([(x0, y0), (x1, y1)], fill=255, width=1)
-        scratch_arr = np.array(scratch_pil, dtype=np.float32) / 255.0
-
-        # v2: 亮度减半
-        opacity = float(rng.uniform(0.06, 0.14)) * strength
-        canvas = np.maximum(canvas, scratch_arr * opacity)
-
-    # v2.3: 新增 2-3 条不规则弯曲划痕（随机游走折线，自然弧度）
-    n_curved = int(rng.integers(2, 4))  # 2-3 条
-    for _ in range(n_curved):
         x = float(rng.uniform(w * 0.08, w * 0.92))
         y = float(rng.uniform(h * 0.08, h * 0.92))
         angle = float(rng.uniform(0, 2 * np.pi))
-        total_len = float(rng.uniform(40, 130))
-        n_seg = int(rng.integers(6, 12))
+        # 长度：旧版 40-130px / 1024 ≈ 短边 4%-13%
+        total_len = float(rng.uniform(0.04, 0.13) * base)
+        n_seg = int(rng.integers(8, 16))
         step = total_len / n_seg
+        # 每条弯曲强度不同：有的平缓，有的明显卷曲
+        curl = float(rng.uniform(0.25, 0.85))
         points = [(x, y)]
         for _ in range(n_seg):
-            # 每段方向小幅随机偏转 → 平滑不规则弯曲
-            angle += float(rng.uniform(-0.5, 0.5))
+            angle += float(rng.uniform(-curl, curl))
             x += np.cos(angle) * step
             y += np.sin(angle) * step
             if not (0 <= x < w and 0 <= y < h):
@@ -351,22 +336,23 @@ def add_scratches(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
         if len(points) < 3:
             continue
 
-        curved_pil = Image.new("L", (w, h), 0)
-        draw_c = ImageDraw.Draw(curved_pil)
-        draw_c.line(points, fill=255, width=1, joint="curve")
-        curved_arr = np.array(curved_pil, dtype=np.float32) / 255.0
+        p = Image.new("L", (w, h), 0)
+        d = ImageDraw.Draw(p)
+        d.line(points, fill=255, width=lw, joint="curve")
+        a = np.array(p, dtype=np.float32) / 255.0
 
-        opacity_c = float(rng.uniform(0.06, 0.14)) * strength
-        canvas = np.maximum(canvas, curved_arr * opacity_c)
+        # 透明度适度调高，使刮痕呈偏白色细痕（之前 0.06-0.14 过淡）
+        opacity = float(rng.uniform(0.20, 0.38)) * strength
+        canvas = np.maximum(canvas, a * opacity)
 
     canvas_pil = Image.fromarray((canvas * 255).astype(np.uint8), mode="L")
-    canvas_pil = canvas_pil.filter(ImageFilter.GaussianBlur(radius=0.4))
+    canvas_pil = canvas_pil.filter(ImageFilter.GaussianBlur(radius=blur_r))
     canvas = np.array(canvas_pil, dtype=np.float32) / 255.0
 
     arr = arr.copy()
     arr[:, :, 0] = np.clip(arr[:, :, 0] + canvas * 0.95, 0, 1)
     arr[:, :, 1] = np.clip(arr[:, :, 1] + canvas * 0.95, 0, 1)
-    arr[:, :, 2] = np.clip(arr[:, :, 2] + canvas * 0.85, 0, 1)
+    arr[:, :, 2] = np.clip(arr[:, :, 2] + canvas * 0.95, 0, 1)
     return arr
 
 
@@ -451,7 +437,7 @@ def add_polaroid_frame(img: Image.Image, bottom_ratio: float = 1.8) -> Image.Ima
 
 def process(input_path: str, output_path: str, strength: float = 1.0,
             add_frame: bool = True, grain: float = 1.0, scratches: float = 1.0,
-            size: int = 1024) -> str:
+            size: int = 0, quality: int = 95) -> str:
     """完整处理流程。"""
     img = Image.open(input_path)
     img = ensure_rgb(img)
@@ -490,7 +476,7 @@ def process(input_path: str, output_path: str, strength: float = 1.0,
 
     # 保存
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    processed.save(output_path, "JPEG", quality=95, optimize=True)
+    processed.save(output_path, "JPEG", quality=quality, optimize=True)
     return output_path
 
 
@@ -510,8 +496,10 @@ def main():
                     help="不添加白色划痕")
     ap.add_argument("--no-frame", action="store_true",
                     help="不添加 Polaroid 白边")
-    ap.add_argument("--size", type=int, default=1024,
-                    help="长边缩放到的像素值（默认 1024）")
+    ap.add_argument("--size", type=int, default=0,
+                    help="长边缩放到的像素值（默认 0 = 保持原图分辨率；>0 则缩放到该值）")
+    ap.add_argument("--quality", type=int, default=95,
+                    help="JPEG 质量 1-100（默认 95；>=95 时关闭色度子采样以保留细节）")
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -536,6 +524,7 @@ def main():
         scratches=scratches,
         add_frame=not args.no_frame,
         size=args.size,
+        quality=int(np.clip(args.quality, 1, 100)),
     )
 
     print(f"[完成] 输出: {result}")
