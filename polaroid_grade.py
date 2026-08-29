@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-polaroid-color-grade (v2.3)
+polaroid-color-grade (v2.4)
 ===========================
 将任意照片转换为 1980s-1990s Polaroid SX-70 / 600 复古 instant-film 风格。
 
@@ -10,11 +10,15 @@ polaroid-color-grade (v2.3)
 - halation 光晕：亮区暖色洇散
 - 饱和度降低约 20%，降清晰度 + 双半径柔焦
 - 极轻的暖色粗颗粒 + 柯达 Portra 400 风格细颗粒
-- 每张图 4-5 处不规则弯曲的自然小刮痕（随机游走折线，每条弯曲程度随机）
+- 每张图 3 处不规则弯曲的自然小刮痕（随机游走折线，每条弯曲程度随机）
 - 经典 Polaroid 暖白边框 #F8F6F1（短边 10%，底边 1.8 倍厚）
+- v2.4 照片/白框衔接内阴影：乳剂面略低于白框，内沿投下极细暖色阴影，
+  固定 30px 渗透深度（与分辨率无关），上深下浅，边缘柔和
 - 保持原图宽高比，不裁剪、不变形
 
-回滚: polaroid_grade_v1.py.bak 为 v1 版本
+回滚:
+    polaroid_grade_v2.3.bak 为 v2.3 版本（无衔接阴影，4-5 条刮痕）
+    polaroid_grade_v1.py.bak 为 v1 版本
 
 依赖:
     pip install pillow numpy
@@ -301,7 +305,7 @@ def add_scratches(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
     - 线宽：旧版 1px / 1024 长边 → 按 max(w,h)/1024 等比（约 5px）
     - 长度：旧版 40-130px / 1024 → 等比为短边的 4%-13%
     - 透明度：0.20-0.38（适度可见，呈偏白色细痕；之前 0.06-0.14 过淡）
-    - 每张图 4-5 条，全部不规则弯曲
+    - v2.4：每张图固定 3 条（原 4-5 条），全部不规则弯曲
     """
     h, w, _ = arr.shape
     rng = np.random.default_rng()
@@ -312,10 +316,15 @@ def add_scratches(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
     blur_r = max(0.4, 0.4 * scale)              # 柔化随分辨率
     base = min(w, h)
 
-    n_scratches = int(rng.integers(4, 6))       # 4-5 条
+    # v2.4: 固定 3 条；用 while 保证实际落笔 3 条（路径出界/过短会重试）
+    n_target = 3
     canvas = np.zeros((h, w), dtype=np.float32)
+    drawn = 0
+    attempts = 0
+    max_attempts = n_target * 5
 
-    for _ in range(n_scratches):
+    while drawn < n_target and attempts < max_attempts:
+        attempts += 1
         x = float(rng.uniform(w * 0.08, w * 0.92))
         y = float(rng.uniform(h * 0.08, h * 0.92))
         angle = float(rng.uniform(0, 2 * np.pi))
@@ -344,6 +353,7 @@ def add_scratches(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
         # 透明度适度调高，使刮痕呈偏白色细痕（之前 0.06-0.14 过淡）
         opacity = float(rng.uniform(0.20, 0.38)) * strength
         canvas = np.maximum(canvas, a * opacity)
+        drawn += 1
 
     canvas_pil = Image.fromarray((canvas * 255).astype(np.uint8), mode="L")
     canvas_pil = canvas_pil.filter(ImageFilter.GaussianBlur(radius=blur_r))
@@ -408,12 +418,63 @@ def add_paper_texture(frame: Image.Image, strength: float = 0.5) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
+def add_inner_edge_shadow(arr: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """
+    v2.4 照片 / 白框衔接内阴影：
+    模拟真实宝丽来——显影乳剂面略低于白框压边，白框内沿在照片上投下一圈极细阴影，
+    避免照片与白框"无痕平贴"的拼接感。
+
+    - 渗透深度固定 30px（绝对像素，与输入分辨率无关，任何尺寸下效果一致）
+    - 方向性：光从上方来 → 上边 1.00 > 左右 0.55 > 下边 0.22
+    - 衰减指数 1.7 + 高斯羽化 → 边缘柔和自然，无生硬边界
+    - 四角封顶 1.0，避免两条边叠加处出现暗块
+    - 暖色阴影（蓝通道压最多），与整体暖底一致
+    """
+    h, w, _ = arr.shape
+    reach = min(30.0, min(h, w) / 6.0)      # 固定 30px；极小图加安全帽
+    ys = np.arange(h, dtype=np.float32)[:, None]
+    xs = np.arange(w, dtype=np.float32)[None, :]
+
+    def prof(d, weight):
+        t = np.clip(1.0 - d / reach, 0.0, 1.0)
+        return weight * (t ** 1.7)
+
+    shade = (
+        prof(ys, 1.00) +               # 上边（最深）
+        prof((h - 1) - ys, 0.22) +     # 下边（最浅）
+        prof(xs, 0.55) +               # 左边
+        prof((w - 1) - xs, 0.55)       # 右边
+    )
+
+    # 四角封顶：两条边叠加处不超过单边最大深度
+    shade = np.clip(shade, 0.0, 1.0)
+
+    # 羽化：reflect 填充后裁切，既柔化过渡又不削平边缘峰值
+    sigma = max(1.5, reach / 8.0)
+    pad = int(reach)
+    padded = np.pad(shade, pad, mode="reflect")
+    p_img = Image.fromarray((np.clip(padded, 0, 1) * 255).astype(np.uint8), mode="L")
+    p_img = p_img.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
+    shade = np.array(p_img, dtype=np.float32)[pad:-pad, pad:-pad] / 255.0
+
+    # 归一化基准取「顶边中心」而非全局峰值（峰值在四角，会把顶边摊薄）
+    ref = float(shade[0, w // 2])
+    if ref > 1e-6:
+        shade = shade / ref
+
+    # 暖色阴影：蓝通道压得最多 → 阴影偏暖棕
+    tint = np.array([0.92, 0.98, 1.06], dtype=np.float32)
+    arr = arr * (1.0 - np.clip(shade, 0.0, 1.0)[..., None] * (0.20 * strength) * tint)
+    return np.clip(arr, 0.0, 1.0)
+
+
 def add_polaroid_frame(img: Image.Image, bottom_ratio: float = 1.8) -> Image.Image:
     """
     v2 Polaroid 边框：
     - 边框宽度 8% → 10%（对齐参考图）
-    - 去掉照片/相纸交界的灰描边（参考图没有）
     - 底边 1.8 倍保持
+    - v2.4：删去交界处浅色描边（由 add_inner_edge_shadow 的阴影取代，
+      否则会形成"一深一浅"双环）
     """
     photo_w, photo_h = img.size
     border = int(min(photo_w, photo_h) * 0.10)   # v2: 0.08 → 0.10
@@ -426,18 +487,13 @@ def add_polaroid_frame(img: Image.Image, bottom_ratio: float = 1.8) -> Image.Ima
     frame = Image.new("RGB", (new_w, new_h), POLAROID_BG)
     frame.paste(img, (left, top))
 
-    # v2: 去掉灰描边，改为极细的暖色投影线（0.5px 感，比 v1 更轻）
-    draw = ImageDraw.Draw(frame)
-    draw.rectangle([left - 1, top - 1, left + photo_w, top + photo_h],
-                   outline=(238, 236, 230), width=1)
-
     frame = add_paper_texture(frame, strength=0.5)
     return frame
 
 
 def process(input_path: str, output_path: str, strength: float = 1.0,
             add_frame: bool = True, grain: float = 1.0, scratches: float = 1.0,
-            size: int = 0, quality: int = 95) -> str:
+            size: int = 0, quality: int = 95, frame_shadow: float = 1.0) -> str:
     """完整处理流程。"""
     img = Image.open(input_path)
     img = ensure_rgb(img)
@@ -463,14 +519,18 @@ def process(input_path: str, output_path: str, strength: float = 1.0,
     # 6. 颗粒（v2: 大幅减弱 + 暖色）
     arr = add_grain(arr, strength=grain)
 
-    # 7. 轻微白色划痕（v2: 减半）
+    # 7. 自然刮痕（v2.4: 固定 3 条）
     if scratches > 0:
         arr = add_scratches(arr, strength=scratches)
+
+    # 8. 照片/白框衔接内阴影（v2.4 新增；仅在加框时有意义）
+    if add_frame and frame_shadow > 0:
+        arr = add_inner_edge_shadow(arr, strength=frame_shadow)
 
     # 转回 PIL
     processed = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8), mode="RGB")
 
-    # 8. 添加相框（v2: 10% 宽）
+    # 9. 添加相框（v2: 10% 宽）
     if add_frame:
         processed = add_polaroid_frame(processed, bottom_ratio=1.8)
 
@@ -482,7 +542,7 @@ def process(input_path: str, output_path: str, strength: float = 1.0,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="将照片转换为 80-90 年代 Polaroid 复古 instant-film 风格 (v2.3)"
+        description="将照片转换为 80-90 年代 Polaroid 复古 instant-film 风格 (v2.4)"
     )
     ap.add_argument("--input", "-i", required=True, help="输入图片路径")
     ap.add_argument("--output", "-o", default=None, help="输出图片路径（默认 ~/Downloads/Polaroid/<name>_polaroid.jpg）")
@@ -494,8 +554,12 @@ def main():
                     help="白色划痕强度 0.0-1.5（默认 1.0，0 表示不添加）")
     ap.add_argument("--no-scratches", action="store_true",
                     help="不添加白色划痕")
+    ap.add_argument("--frame-shadow", type=float, default=1.0,
+                    help="照片/白框衔接阴影强度 0.0-1.5（默认 1.0，0 表示不添加）")
+    ap.add_argument("--no-frame-shadow", action="store_true",
+                    help="不添加衔接阴影")
     ap.add_argument("--no-frame", action="store_true",
-                    help="不添加 Polaroid 白边")
+                    help="不添加 Polaroid 白边（此时衔接阴影自动失效）")
     ap.add_argument("--size", type=int, default=0,
                     help="长边缩放到的像素值（默认 0 = 保持原图分辨率；>0 则缩放到该值）")
     ap.add_argument("--quality", type=int, default=95,
@@ -512,9 +576,13 @@ def main():
         args.output = os.path.join(out_dir, f"{base}_polaroid.jpg")
 
     scratches = 0.0 if args.no_scratches else np.clip(args.scratches, 0.0, 1.5)
+    frame_shadow = 0.0 if args.no_frame_shadow else np.clip(args.frame_shadow, 0.0, 1.5)
+    add_frame = not args.no_frame
 
-    print(f"[Polaroid v2.3] 处理: {args.input}")
-    print(f"  强度={args.strength}, 颗粒={args.grain}, 划痕={scratches}, 相框={'否' if args.no_frame else '是'}")
+    print(f"[Polaroid v2.4] 处理: {args.input}")
+    print(f"  强度={args.strength}, 颗粒={args.grain}, 划痕={scratches}, "
+          f"相框={'否' if not add_frame else '是'}, "
+          f"衔接阴影={'否（无框）' if not add_frame else frame_shadow}")
 
     result = process(
         args.input,
@@ -522,9 +590,10 @@ def main():
         strength=np.clip(args.strength, 0.0, 1.5),
         grain=np.clip(args.grain, 0.0, 1.5),
         scratches=scratches,
-        add_frame=not args.no_frame,
+        add_frame=add_frame,
         size=args.size,
         quality=int(np.clip(args.quality, 1, 100)),
+        frame_shadow=frame_shadow,
     )
 
     print(f"[完成] 输出: {result}")
